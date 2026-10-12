@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, cast, overload
 
 import numpy as np
-from numba import jit
+from numba import jit, prange
 
 from .filters import get_window
 from .util import expand_to, fill_off_diagonal, is_positive_int, pad_center, tiny
@@ -1235,6 +1235,202 @@ def _viterbi(
     return state, logp
 
 
+# --- PROTOTYPE: blocked (max,+) scan Viterbi, specialized to 2 states -------
+# Set librosa.sequence._M2_CHUNKS > 1 to enable; 0 or 1 keeps the stock path.
+# Relates to issue #1480.  A 2-state problem (as produced by viterbi_binary)
+# offers no state-space parallelism, so the only axis left is time: the Viterbi
+# recursion is an associative scan in the (max, +) semiring, so the sequence can
+# be split into chunks that are swept independently and then stitched.
+_M2_CHUNKS = 0
+_M2_PARALLEL = False
+
+
+
+def _viterbi_binary_m2_impl(
+    prob, log_trans, log_marginal, log_p_init, epsilon, n_labels, n_chunks,
+    lo, hi, states, logps, ptr, chunk_mat, ventry, gmap, exit_state, endval,
+):  # pragma: no cover
+    """Decode every 2-state sub-problem of `viterbi_binary` in one kernel.
+
+    Log-likelihoods are computed inline rather than materialized by numpy, and
+    the parallel axis is flattened over (sub-problem, time chunk) so that
+    label-parallelism and time-parallelism share one thread pool.
+
+    Backtracking never selects among entry hypotheses.  Each chunk composes its
+    own pointer maps into ``gmap`` (an endofunction on the 2-element state set),
+    those maps are composed serially across chunks, and the within-chunk
+    pointers are the ones the sequential recursion would have produced.
+    """
+    n_seq = prob.shape[0]
+
+    # -- phase 1: chunk summary matrices (values only, no pointers).  With a
+    #    single chunk there is nothing to stitch, so this sweep is skipped
+    #    entirely and the decode reduces to the sequential recursion.
+    n_mat = n_seq * n_chunks if n_chunks > 1 else 0
+    for w in prange(n_mat):
+        e = w // n_chunks
+        c = w - e * n_chunks
+        lab = e % n_labels
+        t00 = log_trans[lab, 0, 0]
+        t01 = log_trans[lab, 0, 1]
+        t10 = log_trans[lab, 1, 0]
+        t11 = log_trans[lab, 1, 1]
+        m0 = log_marginal[lab, 0]
+        m1 = log_marginal[lab, 1]
+        v00 = 0.0
+        v01 = -np.inf
+        v10 = -np.inf
+        v11 = 0.0
+        for t in range(lo[c], hi[c]):
+            p = prob[e, t]
+            l0 = np.log(1.0 - p + epsilon) - m0
+            l1 = np.log(p + epsilon) - m1
+            a = v00 + t00
+            b = v01 + t10
+            w00 = (a if a >= b else b) + l0
+            a = v00 + t01
+            b = v01 + t11
+            w01 = (a if a >= b else b) + l1
+            a = v10 + t00
+            b = v11 + t10
+            w10 = (a if a >= b else b) + l0
+            a = v10 + t01
+            b = v11 + t11
+            w11 = (a if a >= b else b) + l1
+            v00 = w00
+            v01 = w01
+            v10 = w10
+            v11 = w11
+        chunk_mat[e, c, 0, 0] = v00
+        chunk_mat[e, c, 0, 1] = v01
+        chunk_mat[e, c, 1, 0] = v10
+        chunk_mat[e, c, 1, 1] = v11
+
+    # -- phase 2: serial prefix over chunk summaries, O(n_seq * n_chunks)
+    for e in range(n_seq):
+        lab = e % n_labels
+        p0 = prob[e, 0]
+        ventry[e, 0, 0] = (
+            np.log(1.0 - p0 + epsilon) - log_marginal[lab, 0] + log_p_init[lab, 0]
+        )
+        ventry[e, 0, 1] = (
+            np.log(p0 + epsilon) - log_marginal[lab, 1] + log_p_init[lab, 1]
+        )
+        if n_chunks > 1:
+            for c in range(n_chunks):
+                for j in range(2):
+                    best = -np.inf
+                    for i in range(2):
+                        cost = ventry[e, c, i] + chunk_mat[e, c, i, j]
+                        if cost > best:
+                            best = cost
+                    ventry[e, c + 1, j] = best
+
+    # -- phase 3: re-sweep each chunk from its true entry values.  This
+    #    reproduces the sequential pointers exactly, and composes them into a
+    #    single map from chunk exit state to chunk entry state.
+    for w in prange(n_seq * n_chunks):
+        e = w // n_chunks
+        c = w - e * n_chunks
+        lab = e % n_labels
+        t00 = log_trans[lab, 0, 0]
+        t01 = log_trans[lab, 0, 1]
+        t10 = log_trans[lab, 1, 0]
+        t11 = log_trans[lab, 1, 1]
+        m0 = log_marginal[lab, 0]
+        m1 = log_marginal[lab, 1]
+        v0 = ventry[e, c, 0]
+        v1 = ventry[e, c, 1]
+        g0 = 0
+        g1 = 0
+        for t in range(lo[c], hi[c]):
+            p = prob[e, t]
+            l0 = np.log(1.0 - p + epsilon) - m0
+            l1 = np.log(p + epsilon) - m1
+            a = v0 + t00
+            b = v1 + t10
+            if a >= b:
+                n0 = a + l0
+                p0 = 0
+            else:
+                n0 = b + l0
+                p0 = 1
+            a = v0 + t01
+            b = v1 + t11
+            if a >= b:
+                n1 = a + l1
+                p1 = 0
+            else:
+                n1 = b + l1
+                p1 = 1
+            ptr[e, t, 0] = p0
+            ptr[e, t, 1] = p1
+            if t == lo[c]:
+                g0 = p0
+                g1 = p1
+            else:
+                ng0 = g0 if p0 == 0 else g1
+                ng1 = g0 if p1 == 0 else g1
+                g0 = ng0
+                g1 = ng1
+            v0 = n0
+            v1 = n1
+        gmap[e, c, 0] = g0
+        gmap[e, c, 1] = g1
+        if c == n_chunks - 1:
+            endval[e, 0] = v0
+            endval[e, 1] = v1
+
+    # -- phase 4: compose the chunk maps back to front, O(n_seq * n_chunks)
+    for e in range(n_seq):
+        last = 0 if endval[e, 0] >= endval[e, 1] else 1
+        logps[e] = endval[e, last]
+        s = last
+        for c in range(n_chunks - 1, -1, -1):
+            exit_state[e, c] = s
+            s = gmap[e, c, s]
+        states[e, 0] = s
+
+    # -- phase 5: independent backtrack inside each chunk
+    for w in prange(n_seq * n_chunks):
+        e = w // n_chunks
+        c = w - e * n_chunks
+        s = exit_state[e, c]
+        states[e, hi[c] - 1] = s
+        for t in range(hi[c] - 1, lo[c], -1):
+            prev = ptr[e, t, s]
+            states[e, t - 1] = prev
+            s = prev
+
+
+_viterbi_binary_m2_par = jit(nopython=True, parallel=True)(_viterbi_binary_m2_impl)
+_viterbi_binary_m2_ser = jit(nopython=True, parallel=False)(_viterbi_binary_m2_impl)
+
+
+@jit(nopython=True, cache=True, parallel=True)  # type: ignore
+def _viterbi_binary_m2_parallel(
+    prob, log_trans, log_marginal, log_p_init, epsilon, n_labels, n_chunks,
+    lo, hi, states, logps, ptr, chunk_mat, ventry, gmap, exit_state, endval,
+):  # pragma: no cover
+    """Decode with the parallel build of `_viterbi_binary_m2_impl`."""
+    _viterbi_binary_m2_par(
+        prob, log_trans, log_marginal, log_p_init, epsilon, n_labels, n_chunks,
+        lo, hi, states, logps, ptr, chunk_mat, ventry, gmap, exit_state, endval,
+    )
+
+
+@jit(nopython=True, cache=True, parallel=False)  # type: ignore
+def _viterbi_binary_m2(
+    prob, log_trans, log_marginal, log_p_init, epsilon, n_labels, n_chunks,
+    lo, hi, states, logps, ptr, chunk_mat, ventry, gmap, exit_state, endval,
+):  # pragma: no cover
+    """Decode with the serial build of `_viterbi_binary_m2_impl`."""
+    _viterbi_binary_m2_ser(
+        prob, log_trans, log_marginal, log_p_init, epsilon, n_labels, n_chunks,
+        lo, hi, states, logps, ptr, chunk_mat, ventry, gmap, exit_state, endval,
+    )
+
+
 @overload
 def viterbi(
     prob: np.ndarray,
@@ -1818,6 +2014,59 @@ def viterbi_binary(
         raise ParameterError(f"Invalid initial state distributions: p_init={p_init}")
 
     shape_prefix = list(prob.shape[:-2])
+
+    if (
+        _M2_CHUNKS > 1
+        and n_steps > 1
+        and prob.size >= 1 << 14
+        and (transition_min_prob is None or transition_min_prob == 0)
+    ):
+        # PROTOTYPE: one fused kernel for every 2-state sub-problem, bypassing
+        # the per-label re-entry into viterbi_discriminative (and the O(n_steps)
+        # revalidation it performs, which this function has already done).
+        epsilon = tiny(np.zeros(1, dtype=np.float64))
+        log_trans_all = np.log(transition + epsilon)
+        log_marginal_all = np.log(
+            np.stack([1 - p_state, p_state], axis=-1) + epsilon
+        )
+        log_p_init_all = np.log(np.stack([1 - p_init, p_init], axis=-1) + epsilon)
+
+        prob2 = np.ascontiguousarray(
+            prob.reshape(-1, n_steps), dtype=np.float64
+        )
+        n_seq = prob2.shape[0]
+        # Split the thread budget between sub-problems and time
+        n_chunks = max(1, min(_M2_CHUNKS // n_seq, n_steps - 1))
+        base, extra = divmod(n_steps - 1, n_chunks)
+        lo = np.empty(n_chunks, dtype=np.int64)
+        hi = np.empty(n_chunks, dtype=np.int64)
+        pos = 1
+        for _c in range(n_chunks):
+            lo[_c] = pos
+            pos += base + (1 if _c < extra else 0)
+            hi[_c] = pos
+
+        states2 = np.empty((n_seq, n_steps), dtype=np.uint16)
+        logps2 = np.empty(n_seq, dtype=np.float64)
+        _ptr = np.empty((n_seq, n_steps, 2), dtype=np.uint8)
+        _cmat = np.empty((n_seq, n_chunks, 2, 2), dtype=np.float64)
+        _vent = np.empty((n_seq, n_chunks + 1, 2), dtype=np.float64)
+        _gmap = np.empty((n_seq, n_chunks, 2), dtype=np.uint8)
+        _exit = np.empty((n_seq, n_chunks), dtype=np.uint16)
+        _endv = np.empty((n_seq, 2), dtype=np.float64)
+
+        _kernel = _viterbi_binary_m2_parallel if _M2_PARALLEL else _viterbi_binary_m2
+        _kernel(
+            prob2, log_trans_all, log_marginal_all, log_p_init_all, epsilon,
+            n_states, n_chunks, lo, hi, states2, logps2, _ptr, _cmat, _vent,
+            _gmap, _exit, _endv,
+        )
+        states = states2.reshape([*shape_prefix, n_states, n_steps])
+        logp = logps2.reshape([*shape_prefix, n_states])
+        if return_logp:
+            return states, logp
+        return states
+
     states = np.empty([*shape_prefix, n_states, n_steps], dtype=np.uint16)
     logp = np.empty([*shape_prefix, n_states])
 
